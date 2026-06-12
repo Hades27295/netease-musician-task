@@ -71,7 +71,7 @@ if LOGIN_METHOD not in ('api', 'playwright'):
 
 # ========== Playwright 配置 ==========
 # Playwright profile 根目录（存 cookies/cache/localStorage 等）
-PLAYWRIGHT_PROFILE_BASEDIR = os.getenv('PLAYWRIGHT_PROFILE_BASEDIR', '.playwright_profiles')
+PLAYWRIGHT_PROFILE_BASEDIR = os.getenv('PLAYWRIGHT_PROFILE_BASEDIR', 'playwright_profiles')
 # 多账号是否隔离 profile（建议 True，避免多账号串 Cookie）
 PLAYWRIGHT_PROFILE_PER_USER = os.getenv('PLAYWRIGHT_PROFILE_PER_USER', '1').strip() not in ('0', 'false', 'False')
 
@@ -110,6 +110,10 @@ except ValueError as e:
     SEND_TIME = '09:30'  # 使用默认值
 
 EXECUTION_INTERVAL_DAYS = int(os.getenv('EXECUTION_INTERVAL_DAYS', '3'))  # 执行间隔天数
+
+# ========== Cookie 刷新配置 ==========
+# Cookie 主动刷新检查间隔（小时）
+COOKIE_REFRESH_INTERVAL_HOURS = int(os.getenv('COOKIE_REFRESH_INTERVAL_HOURS', '6'))
 
 # ========== 企业微信 Webhook 通知 ==========
 # 企业微信自定义机器人 Webhook 机器人的 key（不填则不发送）

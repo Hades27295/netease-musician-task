@@ -249,6 +249,103 @@ def retry_with_backoff(func, max_retries=3, delay=2, task_name="任务"):
                 return None
     return None
 
+def check_and_refresh_cookies():
+    """定时检查所有用户的 Cookie 有效性，主动刷新即将过期或已失效的 Cookie。"""
+    from config import COOKIE_REFRESH_INTERVAL_HOURS
+
+    logger.info("[Cookie刷新] 开始检查所有用户的 Cookie 有效性...")
+
+    auth = AuthManager()
+    if not getattr(auth, "redis", None):
+        logger.error("[Cookie刷新] Redis 未就绪，跳过本次检查")
+        return
+
+    user_list = auth.get_all_users_credentials()
+    if not user_list:
+        logger.info("[Cookie刷新] 没有需要检查的用户")
+        return
+
+    refreshed = 0
+    failed = 0
+
+    for user in user_list:
+        uid = user.get('uid')
+        phone = user.get('phone')
+        user_label = f"用户{uid or phone}"
+
+        try:
+            need_refresh = False
+
+            if uid and str(uid) != str(phone):
+                # 检查 Redis 中 Cookie 的 TTL
+                ttl = auth.redis.ttl(f'netease:music:user:{uid}:cookie')
+                if ttl is None or ttl < 0:
+                    logger.warning(f"[Cookie刷新] {user_label} Cookie 不存在，需要重新登录")
+                    need_refresh = True
+                elif ttl < 86400 * 3:  # 剩余不足 3 天
+                    logger.warning(f"[Cookie刷新] {user_label} Cookie 即将过期（剩余 {ttl // 3600} 小时），需要刷新")
+                    need_refresh = True
+                else:
+                    # TTL 充足，验证 Cookie 是否真的有效
+                    client = auth.get_client_by_uid(uid)
+                    if client:
+                        logger.info(f"[Cookie刷新] {user_label} Cookie 有效")
+                        continue
+                    else:
+                        logger.warning(f"[Cookie刷新] {user_label} Cookie 已失效（API 验证失败），需要重新登录")
+                        need_refresh = True
+            else:
+                logger.warning(f"[Cookie刷新] {user_label} 没有有效 UID，需要重新登录")
+                need_refresh = True
+
+            if need_refresh:
+                logger.info(f"[Cookie刷新] 正在为 {user_label} 执行重新登录...")
+                client = auth.login(phone, user.get('password'), task_key=user.get('task_key'))
+                if client:
+                    logger.info(f"[Cookie刷新] {user_label} 重新登录成功")
+                    refreshed += 1
+                else:
+                    logger.error(f"[Cookie刷新] {user_label} 重新登录失败")
+                    failed += 1
+
+        except Exception as e:
+            logger.error(f"[Cookie刷新] 检查 {user_label} 时发生异常: {e}")
+            failed += 1
+
+    logger.info(f"[Cookie刷新] 检查完毕：刷新 {refreshed} 个，失败 {failed} 个")
+
+    # 失败时通过企业微信通知
+    if failed > 0 and WECOM_WEBHOOK_KEY:
+        try:
+            from wecom_notify import send_wecom_webhook
+            send_wecom_webhook(
+                WECOM_WEBHOOK_KEY,
+                f"Cookie 刷新检查完成：刷新 {refreshed} 个，失败 {failed} 个",
+                title="网易云Cookie刷新",
+            )
+        except Exception:
+            pass
+
+
+def _preflight_cookie_check(auth, user_list):
+    """任务执行前的轻量 Cookie 预检：对 TTL 不足 1 天的 Cookie 提前刷新。"""
+    if not getattr(auth, "redis", None) or not user_list:
+        return
+
+    for user in user_list:
+        uid = user.get('uid')
+        phone = user.get('phone')
+        if not uid or str(uid) == str(phone):
+            continue
+        try:
+            ttl = auth.redis.ttl(f'netease:music:user:{uid}:cookie')
+            if ttl is not None and 0 < ttl < 86400:  # 不足 1 天
+                logger.warning(f"预检: 用户 {uid} Cookie 即将过期（剩余 {ttl // 3600} 小时），提前刷新")
+                auth.login(phone, user['password'], task_key=user.get('task_key'))
+        except Exception as e:
+            logger.warning(f"预检: 用户 {uid} Cookie 刷新失败: {e}")
+
+
 def daily_task_runner():
     """每日任务执行函数（日常签到、音乐人签到等）"""
     if "--once" not in sys.argv:
@@ -310,10 +407,13 @@ def daily_task_runner():
 
         auth, user_list = load_res
         logger.info(f"发现 {len(user_list)} 个待处理用户")
-        
+
         if not user_list:
             logger.info("没有待处理的用户，【每日任务】结束")
             return
+
+        # 任务执行前预检 Cookie，对即将过期的提前刷新
+        _preflight_cookie_check(auth, user_list)
             
         for user in user_list:
             user_label = f"用户{user.get('uid') or user.get('phone')}"
@@ -518,11 +618,14 @@ def interval_task_runner():
 
         auth, user_list = load_res
         logger.info(f"发现 {len(user_list)} 个待处理用户")
-        
+
         if not user_list:
             logger.info("没有待处理的用户，【间隔任务】结束")
             return
-        
+
+        # 任务执行前预检 Cookie，对即将过期的提前刷新
+        _preflight_cookie_check(auth, user_list)
+
         for user in user_list:
             user_uid = user.get('uid', user.get('phone'))
             user_label = f"用户{user_uid}"
@@ -882,9 +985,21 @@ def main():
             replace_existing=True,
             misfire_grace_time=30
         )
-        
+
+        # 添加 Cookie 刷新检查 - 每 N 小时执行一次
+        from config import COOKIE_REFRESH_INTERVAL_HOURS
+        scheduler.add_job(
+            func=check_and_refresh_cookies,
+            trigger=CronTrigger(hour=f'*/{COOKIE_REFRESH_INTERVAL_HOURS}', minute=17),
+            id='netease_cookie_refresh',
+            name='网易云音乐Cookie刷新检查',
+            replace_existing=True,
+            misfire_grace_time=60,
+        )
+
         logger.info(f"每日任务已添加，每天 {SEND_TIME} 执行")
         logger.info(f"间隔任务已添加，每天 {interval_hour:02d}:{interval_minute:02d} 执行检查，实际执行间隔：每 {EXECUTION_INTERVAL_DAYS} 天")
+        logger.info(f"Cookie刷新检查已添加，每 {COOKIE_REFRESH_INTERVAL_HOURS} 小时执行一次")
         logger.info("任务调度器已启动，按 Ctrl+C 停止")
         
         # 启动调度器

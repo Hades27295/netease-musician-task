@@ -43,7 +43,7 @@ LOGIN_URL = "https://music.163.com/#/login?targetUrl=https%3A%2F%2Fmusic.163.com
 FIXED_UID: Optional[int] = None
 
 # Playwright 持久化用户目录（可复用登录态，默认在项目根目录）
-PROFILE_DIR = os.path.join(_PROJECT_ROOT, ".playwright_profiles")
+PROFILE_DIR = os.path.join(_PROJECT_ROOT, "playwright_profiles")
 
 
 # ======== 工具函数 ========
@@ -53,6 +53,31 @@ def _phone_debug_subdir(phone: str) -> str:
     """用于 debug 目录名，避免路径非法字符。"""
     s = re.sub(r"[^\d+]+", "_", (phone or "").strip())
     return s.strip("_") or "unknown"
+
+
+def _notify_secondary_verification(phone: str, qr_url: str | None = None, *, timeout: bool = False) -> None:
+    """二次验证通知：通过企业微信 Webhook 推送扫码链接或超时提醒。"""
+    try:
+        from config import WECOM_WEBHOOK_KEY
+        if not WECOM_WEBHOOK_KEY:
+            return
+
+        from wecom_notify import send_wecom_webhook
+
+        if timeout:
+            send_wecom_webhook(
+                WECOM_WEBHOOK_KEY,
+                f"账号 {phone} 的二次验证等待超时，请重新运行或在下次任务执行时及时扫码",
+                title="网易云二次验证超时",
+            )
+        elif qr_url:
+            send_wecom_webhook(
+                WECOM_WEBHOOK_KEY,
+                f"账号 {phone} 需要二次验证，请用网易云音乐App扫描以下二维码链接：\n{qr_url}\n\n（链接可直接在浏览器打开查看二维码）",
+                title="网易云二次验证-请扫码",
+            )
+    except Exception as e:
+        logger.warning(f"[二次验证通知] 发送企业微信通知失败: {e}")
 
 
 def save_login_debug_screenshot(page: Page | Frame, phone: str, tag: str) -> Optional[str]:
@@ -477,7 +502,7 @@ def solve_slider_captcha(page: Page | Frame, max_retry: int = 3, *, debug_phone:
         save_login_debug_screenshot(page, debug_phone, "slider_failed")
 
 
-def check_secondary_verification(page: Page | Frame, timeout: int = 10, *, auto_action: bool = True) -> bool:
+def check_secondary_verification(page: Page | Frame, timeout: int = 10, *, auto_action: bool = True, phone: str | None = None) -> bool:
     """
     检查是否需要二次验证（登录安全验证弹窗）。
     如果出现二次验证弹窗，记录日志并返回 True。
@@ -539,6 +564,8 @@ def check_secondary_verification(page: Page | Frame, timeout: int = 10, *, auto_
                                                 + urllib.parse.quote(qr_uri, safe="")
                                             )
                                             logger.warning(f"[二次验证] 扫码二维码链接：{qr_url}")
+                                            # 推送扫码通知到企业微信
+                                            _notify_secondary_verification(phone=phone or "", qr_url=qr_url)
                                             # 标记：已进入扫码验证流程，后续应至少等待一段时间给用户扫码
                                             try:
                                                 setattr(pw_page, "_secondary_scan_started_at", time.time())
@@ -648,7 +675,6 @@ def browser_login(phone: str, password: str, profile_dir: str = PROFILE_DIR, hea
         raise ValueError("phone/password 不能为空")
 
     os.makedirs(os.path.join(_PROJECT_ROOT, "log"), exist_ok=True)
-    profile_dir = os.path.join(profile_dir, phone)
     with sync_playwright() as p:
         # 反检测配置（保守版本，避免破坏页面功能）
         context = p.chromium.launch_persistent_context(
@@ -731,7 +757,7 @@ def browser_login(phone: str, password: str, profile_dir: str = PROFILE_DIR, hea
 
         # 滑块验证完成后，检查是否需要二次验证
         try:
-            needs_secondary = check_secondary_verification(page, timeout=10)
+            needs_secondary = check_secondary_verification(page, timeout=10, phone=phone)
             if needs_secondary:
                 logger.warning("[登录] 检测到需要二次验证，等待用户手动完成...")
                 # 扫码验证：最多等 60 秒，每 5 秒检查一次；用户提前完成就立刻继续
@@ -744,7 +770,7 @@ def browser_login(phone: str, password: str, profile_dir: str = PROFILE_DIR, hea
                     scan_deadline = time.time() + 60
                     while time.time() < scan_deadline:
                         # 被动检测：不重复点击/不重复生成二维码
-                        still_needs_scan = check_secondary_verification(page, timeout=2, auto_action=False)
+                        still_needs_scan = check_secondary_verification(page, timeout=2, auto_action=False, phone=phone)
                         if not still_needs_scan:
                             logger.info("[登录] 二次验证已完成（扫码），继续登录流程")
                             break
@@ -753,7 +779,7 @@ def browser_login(phone: str, password: str, profile_dir: str = PROFILE_DIR, hea
                 # 循环检查，最多等待 120 秒，直到二次验证弹窗消失（被动检测）
                 secondary_deadline = time.time() + 120
                 while time.time() < secondary_deadline:
-                    still_needs = check_secondary_verification(page, timeout=2, auto_action=False)
+                    still_needs = check_secondary_verification(page, timeout=2, auto_action=False, phone=phone)
                     if not still_needs:
                         logger.info("[登录] 二次验证已完成，继续登录流程")
                         break
@@ -761,6 +787,7 @@ def browser_login(phone: str, password: str, profile_dir: str = PROFILE_DIR, hea
                 else:
                     logger.warning("[登录] 二次验证等待超时，继续尝试获取 Cookie")
                     save_login_debug_screenshot(page, phone, "secondary_verify_timeout")
+                    _notify_secondary_verification(phone=phone, qr_url=None, timeout=True)
         except Exception as e:
             logger.warning(f"检查二次验证时出错：{e}")
             save_login_debug_screenshot(page, phone, "secondary_verify_error")
